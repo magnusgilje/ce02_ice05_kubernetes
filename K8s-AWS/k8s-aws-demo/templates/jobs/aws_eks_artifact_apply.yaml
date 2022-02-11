@@ -1,0 +1,100 @@
+parameters:
+  - name: "ArtifactName"
+    type: string
+  - name: "ShortName"
+    type: string
+  - name: "Repository"
+    type: string
+  - name: "AWSCredentials"
+    type: string
+  - name: "AwsRegion"
+    type: string
+  - name: "Name"
+    type: string
+  - name: "Environment"
+    type: string
+  - name: "ClusterName"
+    type: string
+  - name: "DNS"
+    type: string
+  - name: "Certificate"
+    type: string
+jobs:
+  - job: ${{ parameters.Name }}
+    displayName: "Promote ${{ parameters.Name }}"
+    pool:
+      vmImage: "ubuntu-latest"
+    variables:
+      - name: container.image
+        value: "${{parameters.Repository}}:${{parameters.Environment}}"
+      - name: container.environment
+        value: ${{parameters.Environment}}
+    steps:
+      - checkout: none
+      - task: AWSShellScript@1
+        displayName: "AWS Deploy to AWS"
+        inputs:
+          awsCredentials: "${{parameters.AWSCredentials}}"
+          regionName: "${{parameters.AwsRegion}}"
+          scriptType: "inline"
+          inlineScript: |
+            MANIFEST=$(aws ecr batch-get-image --repository-name ${{ parameters.ShortName }} --image-ids imageTag=$(build.buildnumber) --query 'images[].imageManifest' --output text)
+            aws ecr put-image --repository-name ${{ parameters.ShortName }} --image-tag "${{parameters.Environment}}" --image-manifest "$MANIFEST"
+          failOnStandardError: true
+  - job: deploy
+    displayName: "eks deployment"
+    pool:
+      vmImage: "ubuntu-latest"
+    dependsOn: ${{ parameters.Name }}
+    variables:
+      - name: container.image
+        value: "${{parameters.Repository}}:${{parameters.Environment}}"
+      - name: container.environment
+        value: ${{parameters.Environment}}
+      - name: container.namespace
+        value: ${{parameters.Name}}-${{parameters.Environment}}
+      - name: container.dns
+        value: "${{parameters.DNS}}"
+      - name: container.certificate
+        value: "${{parameters.Certificate}}"
+    steps:
+      - checkout: none
+      - task: DownloadPipelineArtifact@2
+        displayName: Download hugo deployment YAML
+        inputs:
+          buildType: "current"
+          artifactName: "${{parameters.ArtifactName}}"
+      - task: replacetokens@3
+        inputs:
+          targetFiles: "$(Pipeline.Workspace)/deployment.yaml"
+          encoding: "auto"
+          writeBOM: true
+          actionOnMissing: "warn"
+          keepToken: false
+          tokenPrefix: "<<<"
+          tokenSuffix: ">>>"
+          useLegacyPattern: false
+          emptyValue:
+          enableTransforms: false
+          enableTelemetry: true
+        displayName: "Replace tokens in YAML"
+      - task: PowerShell@2
+        displayName: "export the kubernetes YAML"
+        inputs:
+          targetType: "inline"
+          script: "gc $(Pipeline.Workspace)/deployment.yaml"
+          pwsh: true
+      - task: KubectlInstaller@0
+        inputs:
+          kubectlVersion: "latest"
+      - task: AWSShellScript@1
+        displayName: "AWS Deploy to AWS"
+        inputs:
+          awsCredentials: "${{parameters.AWSCredentials}}"
+          regionName: "${{parameters.AwsRegion}}"
+          scriptType: "inline"
+          inlineScript: |
+            aws eks update-kubeconfig --name ${{parameters.ClusterName}}
+            kubectl create namespace $(container.namespace)
+            kubectl apply -f $(Pipeline.Workspace)/deployment.yaml --force=true --grace-period=0
+            kubectl rollout restart deployment/$(container.namespace) --namespace=$(container.namespace)

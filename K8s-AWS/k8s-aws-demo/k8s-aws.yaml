@@ -1,0 +1,351 @@
+trigger:
+  branches:
+    include:
+      - refs/heads/main
+name: "$(TeamProject)_$(Build.DefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)"
+parameters:
+  - name: PythonVersion
+    displayName: Python Version
+    type: string
+    values:
+      - 3.7
+      - 3.8
+      - 3.9
+      - 3.10
+    default: 3.10
+  - name: TerraformVersion
+    displayName: Terraform Version
+    type: string
+    values:
+      - 1.1.4
+    default: 1.1.4
+  - name: AwsRegion
+    displayName: AWS Region
+    type: string
+    values:
+      - eu-west-1
+      - eu-west-2
+    default: eu-west-1
+variables:
+  - name: Artifact.iac
+    value: "iac"
+  - name: Artifact.docker
+    value: "docker"
+  - name: image.name
+    value: "edgar"
+  - name: Artifact.hugo.deployment
+    value: "edgar_deployment"
+  - name: "Terraform.StateFile"
+    value: "$(System.TeamProject)_$(Build.DefinitionName)_$(Build.SourceBranchName)_$(System.StageName)_state.tfstate"
+stages:
+  - stage: build
+    jobs:
+      - template: templates/jobs/shift_left.yaml
+        parameters:
+          PythonVersion: "${{ parameters.PythonVersion }}"
+          workingDirectory: "tests/ci"
+          name: "pre_build"
+      - job: build
+        displayName: build artifacts
+        dependsOn: pre_build
+        pool:
+          vmImage: windows-latest
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+          - script: |
+              choco install hugo-extended -y
+              cd hugo
+              hugo -D
+            displayName: "Initialise API"
+          - task: CopyFiles@2
+            displayName: Copy aws Files
+            inputs:
+              SourceFolder: "iac"
+              TargetFolder: "$(Build.ArtifactStagingDirectory)/$(Artifact.iac)"
+              preserveTimestamp: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact: iac"
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/$(Artifact.iac)
+              ArtifactName: $(Artifact.iac)
+          - task: CopyFiles@2
+            displayName: Copy docker files
+            inputs:
+              Contents: |
+                hugo/Dockerfile
+                hugo/public/**
+              TargetFolder: "$(Build.ArtifactStagingDirectory)/$(Artifact.docker)"
+              preserveTimestamp: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact: docker"
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/$(Artifact.docker)
+              ArtifactName: $(Artifact.docker)
+          - task: CopyFiles@2
+            displayName: Copy hugo kubernetes YAML
+            inputs:
+              Contents: |
+                hugo/deployment.yaml
+              flattenFolders: true
+              TargetFolder: "$(Build.ArtifactStagingDirectory)/$(Artifact.hugo.deployment)"
+              preserveTimestamp: true
+          - task: PublishBuildArtifacts@1
+            displayName: "Publish Artifact: hugo kubernetes YAML"
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/$(Artifact.hugo.deployment)
+              ArtifactName: $(Artifact.hugo.deployment)
+          - task: CmdLine@2
+            displayName: "tag repo in git"
+            inputs:
+              script: |
+                git tag $(Build.BuildNumber)
+                git push origin $(Build.BuildNumber)
+            condition: succeeded()
+  - stage: aws_iac_ecr
+    displayName: "aws ecr infrastructure"
+    dependsOn: build
+    variables:
+      - group: ce02-AWS-Terraform-dev
+    jobs:
+      - job: iac_ecr
+        displayName: "Container Registry infrastructure deployment"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: Download iac artifact
+            inputs:
+              buildType: "current"
+              artifactName: "$(Artifact.iac)"
+              targetPath: "$(Pipeline.Workspace)/$(Artifact.iac)"
+          - template: templates/steps/aws_terraform.yaml
+            parameters:
+              backendServiceAWS: "ce02-AWS-Terraform-dev"
+              AwsRegion: "${{parameters.AwsRegion}}"
+              backendAWSBucketName: "$(AWS.backendAWSBucketName)"
+              TerraformVersion: "${{ parameters.TerraformVersion }}"
+              workingDirectory: "$(System.DefaultWorkingDirectory)/$(Artifact.iac)/ecr"
+              TerraformStateFile: "$(Terraform.StateFile)"
+              Environment: $(image.name)
+          - script: |
+              echo "##vso[task.setvariable variable=repository_url;isOutput=true]$(aws.tf.repository_url)"
+              echo "##vso[task.setvariable variable=ecr_shortname;isOutput=true]$(aws.tf.ecr_shortname)"
+            name: outputs
+            displayName: "create stage outputs"
+  - stage: aws_hugo_container_creation
+    displayName: "container creation"
+    dependsOn: aws_iac_ecr
+    variables:
+      - group: ce02-AWS-Terraform-dev
+      - name: ECRUrl
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.repository_url']]
+    jobs:
+      - template: templates/jobs/aws_docker_artifact.yaml
+        parameters:
+          Name: "edgar"
+          ArtifactName: $(Artifact.docker)
+          AWSCredentials: "ce02-AWS-dev"
+          AwsRegion: ${{parameters.AwsRegion}}
+          ECRUrl: $(ECRUrl)
+  - stage: aws_dev_iac_k8s
+    displayName: "aws kubernetes dev infrastructure"
+    dependsOn: build
+    variables:
+      - group: ce02-AWS-Terraform-dev
+    jobs:
+      - job: iac_k8s
+        displayName: "kubernetes infrastructure deployment"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            displayName: Download iac artifact
+            inputs:
+              buildType: "current"
+              artifactName: "$(Artifact.iac)"
+              targetPath: "$(Pipeline.Workspace)/$(Artifact.iac)"
+          - template: templates/steps/aws_terraform.yaml
+            parameters:
+              backendServiceAWS: "ce02-AWS-Terraform-dev"
+              AwsRegion: ${{parameters.AwsRegion}}
+              backendAWSBucketName: $(AWS.backendAWSBucketName)
+              TerraformVersion: ${{ parameters.TerraformVersion }}
+              workingDirectory: "$(System.DefaultWorkingDirectory)/$(Artifact.iac)/eks"
+              TerraformStateFile: $(Terraform.StateFile)
+              Environment: "dev"
+          - script: |
+              echo "##vso[task.setvariable variable=eks_cluster_name;isOutput=true]$(aws.tf.eks_cluster_name)"
+              echo "##vso[task.setvariable variable=certificate_arn;isOutput=true]$(aws.tf.certificate_arn)"
+              echo "##vso[task.setvariable variable=domain_name;isOutput=true]$(aws.tf.domain_name)"
+            name: outputs
+            displayName: "create stage outputs"
+  - stage: aws_test_iac_k8s
+    displayName: "aws kubernetes test infrastructure"
+    dependsOn:
+      - build
+      - aws_dev_iac_k8s
+    variables:
+      - group: ce02-AWS-Terraform-test
+    jobs:
+      - job: iac_k8s
+        displayName: "kubernetes infrastructure deployment"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            displayName: Download iac artifact
+            inputs:
+              buildType: "current"
+              artifactName: "$(Artifact.iac)"
+              targetPath: "$(Pipeline.Workspace)/$(Artifact.iac)"
+          - template: templates/steps/aws_terraform.yaml
+            parameters:
+              backendServiceAWS: "ce02-AWS-Terraform-test"
+              AwsRegion: ${{parameters.AwsRegion}}
+              backendAWSBucketName: $(AWS.backendAWSBucketName)
+              TerraformVersion: ${{ parameters.TerraformVersion }}
+              workingDirectory: "$(System.DefaultWorkingDirectory)/$(Artifact.iac)/eks"
+              TerraformStateFile: $(Terraform.StateFile)
+              Environment: "test"
+          - script: |
+              echo "##vso[task.setvariable variable=eks_cluster_name;isOutput=true]$(aws.tf.eks_cluster_name)"
+              echo "##vso[task.setvariable variable=certificate_arn;isOutput=true]$(aws.tf.certificate_arn)"
+              echo "##vso[task.setvariable variable=domain_name;isOutput=true]$(aws.tf.domain_name)"
+            name: outputs
+            displayName: "create stage outputs"
+  - stage: aws_prod_iac_k8s
+    displayName: "aws kubernetes prod infrastructure"
+    dependsOn:
+      - build
+      - aws_test_iac_k8s
+    variables:
+      - group: ce02-AWS-Terraform-prod
+    jobs:
+      - job: iac_k8s
+        displayName: "kubernetes infrastructure deployment"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+          - task: DownloadPipelineArtifact@2
+            displayName: Download iac artifact
+            inputs:
+              buildType: "current"
+              artifactName: "$(Artifact.iac)"
+              targetPath: "$(Pipeline.Workspace)/$(Artifact.iac)"
+          - template: templates/steps/aws_terraform.yaml
+            parameters:
+              backendServiceAWS: "ce02-AWS-Terraform-prod"
+              AwsRegion: ${{parameters.AwsRegion}}
+              backendAWSBucketName: $(AWS.backendAWSBucketName)
+              TerraformVersion: ${{ parameters.TerraformVersion }}
+              workingDirectory: "$(System.DefaultWorkingDirectory)/$(Artifact.iac)/eks"
+              TerraformStateFile: $(Terraform.StateFile)
+              Environment: "prod"
+          - script: |
+              echo "##vso[task.setvariable variable=eks_cluster_name;isOutput=true]$(aws.tf.eks_cluster_name)"
+              echo "##vso[task.setvariable variable=certificate_arn;isOutput=true]$(aws.tf.certificate_arn)"
+              echo "##vso[task.setvariable variable=domain_name;isOutput=true]$(aws.tf.domain_name)"
+            name: outputs
+            displayName: "create stage outputs"
+  - stage: dev
+    displayName: "dev"
+    dependsOn:
+      - aws_iac_ecr
+      - aws_hugo_container_creation
+      - aws_dev_iac_k8s
+    variables:
+      - group: ce02-AWS-Terraform-dev
+      - name: Cluster.Name
+        value: $[stageDependencies.aws_dev_iac_k8s.iac_k8s.outputs['outputs.eks_cluster_name']]
+      - name: Cluster.ShortName
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.ecr_shortname']]
+      - name: Cluster.Repository
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.repository_url']]
+      - name: Cluster.DNS
+        value: $[stageDependencies.aws_dev_iac_k8s.iac_k8s.outputs['outputs.domain_name']]
+      - name: Cluster.Certificate
+        value: $[stageDependencies.aws_dev_iac_k8s.iac_k8s.outputs['outputs.certificate_arn']]
+    jobs:
+      - template: templates/jobs/aws_eks_artifact_apply.yaml
+        parameters:
+          name: "hugo"
+          ShortName: $(Cluster.ShortName)
+          Repository: $(Cluster.Repository)
+          Environment: $(System.StageName)
+          ArtifactName: $(Artifact.hugo.deployment)
+          AWSCredentials: "ce02-AWS-dev"
+          AwsRegion: ${{parameters.AwsRegion}}
+          ClusterName: $(Cluster.Name)
+          DNS: $(Cluster.DNS)
+          Certificate: $(Cluster.Certificate)
+  - stage: test
+    displayName: "test"
+    dependsOn:
+      - aws_iac_ecr
+      - dev
+      - aws_test_iac_k8s
+    variables:
+      - group: ce02-AWS-Terraform-test
+      - name: Cluster.Name
+        value: $[stageDependencies.aws_test_iac_k8s.iac_k8s.outputs['outputs.eks_cluster_name']]
+      - name: Cluster.ShortName
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.ecr_shortname']]
+      - name: Cluster.Repository
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.repository_url']]
+      - name: Cluster.DNS
+        value: $[stageDependencies.aws_test_iac_k8s.iac_k8s.outputs['outputs.domain_name']]
+      - name: Cluster.Certificate
+        value: $[stageDependencies.aws_test_iac_k8s.iac_k8s.outputs['outputs.certificate_arn']]
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - template: templates/jobs/aws_eks_artifact_apply.yaml
+        parameters:
+          name: "hugo"
+          ShortName: $(Cluster.ShortName)
+          Repository: $(Cluster.Repository)
+          Environment: $(System.StageName)
+          ArtifactName: $(Artifact.hugo.deployment)
+          AWSCredentials: "ce02-AWS-test"
+          AwsRegion: ${{parameters.AwsRegion}}
+          ClusterName: $(Cluster.Name)
+          DNS: $(Cluster.DNS)
+          Certificate: $(Cluster.Certificate)
+  - stage: prod
+    displayName: "prod"
+    dependsOn:
+      - aws_iac_ecr
+      - test
+      - aws_prod_iac_k8s
+    variables:
+      - group: ce02-AWS-Terraform-prod
+      - name: Cluster.Name
+        value: $[stageDependencies.aws_prod_iac_k8s.iac_k8s.outputs['outputs.eks_cluster_name']]
+      - name: Cluster.ShortName
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.ecr_shortname']]
+      - name: Cluster.Repository
+        value: $[stageDependencies.aws_iac_ecr.iac_ecr.outputs['outputs.repository_url']]
+      - name: Cluster.DNS
+        value: $[stageDependencies.aws_prod_iac_k8s.iac_k8s.outputs['outputs.domain_name']]
+      - name: Cluster.Certificate
+        value: $[stageDependencies.aws_prod_iac_k8s.iac_k8s.outputs['outputs.certificate_arn']]
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - template: templates/jobs/aws_eks_artifact_apply.yaml
+        parameters:
+          name: "hugo"
+          ShortName: $(Cluster.ShortName)
+          Repository: $(Cluster.Repository)
+          Environment: $(System.StageName)
+          ArtifactName: $(Artifact.hugo.deployment)
+          AWSCredentials: "ce02-AWS-prod"
+          AwsRegion: ${{parameters.AwsRegion}}
+          ClusterName: $(Cluster.Name)
+          DNS: $(Cluster.DNS)
+          Certificate: $(Cluster.Certificate)

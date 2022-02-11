@@ -1,0 +1,55 @@
+---
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: circle-<<<container.environment>>>
+
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: circle-<<<container.environment>>>
+  namespace: circle-<<<container.environment>>>
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: circle-<<<container.environment>>>
+  template:
+    metadata:
+      labels:
+        app: circle-<<<container.environment>>>
+    spec:
+      containers:
+        - name: circle-<<<container.environment>>>
+          image: <<<container.image>>>
+          imagePullPolicy: Always
+          resources:
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: circle-<<<container.environment>>>
+  namespace: circle-<<<container.environment>>>
+  annotations:
+    # Note that the backend talks over HTTP.
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: http
+    # TODO: Fill in with the ARN of your certificate. ---- arn:aws:acm:eu-west-1:411447780843:certificate/a963ca1c-30a1-431a-b1d4-35e1f4d7744e
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: <<<container.certificate>>>
+    # Only run SSL on the port named "https" below.
+    external-dns.alpha.kubernetes.io/hostname: <<<container.dns>>>
+spec:
+  selector:
+    app: circle-<<<container.environment>>>
+  ports:
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: 80
+  type: LoadBalancer

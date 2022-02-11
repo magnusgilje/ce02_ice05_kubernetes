@@ -1,0 +1,2 @@
+prefix      = "kubrick"
+environment = "edgar"
